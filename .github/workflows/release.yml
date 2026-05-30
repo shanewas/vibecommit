@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build artifacts
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          body: |
+            ## 🪄 VibeCommit v${{ github.ref_name }}
+
+            **Beautiful, smart & fun conventional commits with vibes.**
+
+            ### Install
+            ```bash
+            pipx install git+https://github.com/shanewas/vibecommit.git@${{ github.ref_name }}
+            # or
+            pip install git+https://github.com/shanewas/vibecommit.git@${{ github.ref_name }}
+            ```
+
+            See [CHANGELOG](https://github.com/shanewas/vibecommit/blob/main/CHANGELOG.md) for full details.
+
+            **Full release notes generated automatically below.**
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ github.ref_name }}
+          path: dist/
