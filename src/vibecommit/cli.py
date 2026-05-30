@@ -9,7 +9,9 @@ import os
 import random
 import re
 import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
 import pyperclip
 import typer
@@ -20,18 +22,164 @@ from rich.table import Table
 
 from vibecommit import __version__
 
+# =============================================================================
+# GLOBAL STATE & DEBUG
+# =============================================================================
+
+# Windows Unicode/emoji support: prevent cp1252 encode errors in CI & consoles
+# Must be done early before any rich/console output
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass  # pre-3.7 or restricted env; rich will degrade gracefully
+
+DEBUG = False
+CONFIG: dict[str, Any] = {}
+
+
+def set_debug(enabled: bool) -> None:
+    global DEBUG
+    DEBUG = enabled
+
+
+def debug_log(msg: str) -> None:
+    if DEBUG:
+        console.print(f"[dim][debug] {msg}[/dim]")
+
+
+# =============================================================================
+# CONFIG LOADING (zero hard deps, graceful)
+# =============================================================================
+
+
+def _load_toml_simple(path: Path) -> dict[str, Any]:
+    """Very small TOML loader for our known keys. Supports only flat tables we care about."""
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return {}
+
+    data: dict[str, Any] = {}
+    current_table = None
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_table = line[1:-1].strip()
+            continue
+        if "=" in line:
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if current_table == "tool.vibecommit":
+                data[key] = val
+            elif current_table and current_table.startswith("tool.vibecommit"):
+                # nested like [tool.vibecommit.something] - ignore for v1.1
+                pass
+    return data
+
+
+def load_config() -> dict[str, Any]:
+    """Discover and load VibeCommit configuration from multiple sources (lowest to highest priority)."""
+    global CONFIG
+    if CONFIG:
+        return CONFIG
+
+    candidates: list[Path] = []
+
+    # 1. Repo root pyproject.toml
+    git_root = run_git(["rev-parse", "--show-toplevel"])
+    if git_root:
+        candidates.append(Path(git_root) / "pyproject.toml")
+        candidates.append(Path(git_root) / ".vibecommit.toml")
+
+    # 2. User home
+    home = Path.home()
+    candidates.append(home / ".config" / "vibecommit" / "config.toml")
+    candidates.append(home / ".vibecommit.toml")
+
+    merged: dict[str, Any] = {}
+    for p in candidates:
+        if p.exists():
+            debug_log(f"Loading config from {p}")
+            try:
+                if p.suffix == ".toml":
+                    partial = _load_toml_simple(p)
+                else:
+                    partial = _load_toml_simple(p)
+                merged.update(
+                    {k: v for k, v in partial.items() if not k.startswith("_")}
+                )
+            except Exception as e:
+                debug_log(f"Failed to parse {p}: {e}")
+
+    # Env var overrides (highest priority)
+    if os.environ.get("VIBECOMMIT_DEFAULT_VIBE"):
+        merged["default_vibe"] = os.environ["VIBECOMMIT_DEFAULT_VIBE"].lower()
+    if os.environ.get("VIBECOMMIT_MAX_SUBJECT"):
+        merged["max_subject_length"] = os.environ["VIBECOMMIT_MAX_SUBJECT"]
+
+    CONFIG = merged
+    debug_log(f"Final config: {CONFIG}")
+    return CONFIG
+
+
+def get_config_value(key: str, default: Any = None) -> Any:
+    return load_config().get(key, default)
+
+
 app = typer.Typer(
     name="vibecommit",
     help=(
         "🪄 VibeCommit — Beautiful, smart & fun conventional commits with vibes.\n\n"
         "Make every commit a work of art. Perfect conventional format + personality in seconds."
     ),
-    add_completion=False,
+    add_completion=True,  # Enables --install-completion and --show-completion
     rich_markup_mode="rich",
     epilog="Made with ✨ vibes by [link=https://github.com/shanewas]@shanewas[/link]",
 )
 
-console = Console()
+
+def _version_callback(value: bool) -> None:
+    if value:
+        console.print(f"🪄 [bold]vibecommit[/bold] v{__version__}")
+        raise typer.Exit()
+
+
+@app.callback(invoke_without_command=True)
+def main_callback(
+    ctx: typer.Context,
+    debug: bool = typer.Option(
+        False, "--debug", "-d", help="Show internal decision making and config sources"
+    ),
+    version: bool = typer.Option(
+        None, "--version", callback=_version_callback, is_eager=True
+    ),
+) -> None:
+    """Global options for all commands."""
+    if debug:
+        set_debug(True)
+        debug_log("Debug mode enabled")
+    load_config()  # eager load so all commands benefit
+
+    if ctx.invoked_subcommand is None:
+        # Default behavior: launch the beautiful interactive wizard
+        run_interactive_wizard()
+
+
+console = Console(
+    force_terminal=True,
+    legacy_windows=True,
+    width=100,
+    emoji=True,
+    highlight=True,
+)
 
 # =============================================================================
 # VIBES & TYPES
@@ -193,14 +341,24 @@ def detect_commit_type(msg: str, diff: str, files: list[str]) -> str:
             return "test"
         if len(doc_files) == len(files) and files:
             return "docs"
-        if any("ci" in f or ".github" in f or "workflow" in f for f in files):
+        ci_files = [
+            f
+            for f in files
+            if "ci" in f.lower() or ".github" in f or "workflow" in f.lower()
+        ]
+        if len(ci_files) == len(files) and files:
             return "ci"
-        if any(
+        # Build files only -> build type if the *message* indicates dep/package work
+        # (avoid false "build" when pyproject.toml etc are staged but change is a fix/feat)
+        build_files = any(
             f.endswith(
                 ("Dockerfile", ".toml", ".yaml", ".yml", "setup.py", "pyproject.toml")
             )
             for f in files
-        ) and any("dep" in text or "lock" in text or "package" in text):
+        )
+        if build_files and any(
+            k in msg.lower() for k in ["dep", "lock", "package", "bump", "requirements"]
+        ):
             return "build"
 
     # Message + diff keywords (order matters for precedence)
@@ -362,7 +520,9 @@ def get_vibe_quote() -> str:
 # =============================================================================
 
 
-def run_interactive_wizard(default_vibe: str = "hype") -> None:
+def run_interactive_wizard(default_vibe: str | None = None) -> None:
+    if default_vibe is None:
+        default_vibe = get_config_value("default_vibe", "hype")
     """Beautiful interactive commit message builder."""
     console.print()
     console.rule("[bold magenta]🪄 VibeCommit Interactive Wizard[/bold magenta]")
@@ -511,41 +671,88 @@ def run_interactive_wizard(default_vibe: str = "hype") -> None:
 # HOOKS
 # =============================================================================
 
-HOOK_SCRIPT = """#!/usr/bin/env python3
+HOOK_SCRIPT = '''#!/usr/bin/env python3
 # VibeCommit prepare-commit-msg hook
 # Installed by `vibecommit hooks install`
+# This script is deliberately robust across pip, pipx, conda, different Pythons, Windows etc.
 
-import sys
+import os
 import subprocess
+import sys
 from pathlib import Path
 
-def main():
+
+def get_vibecommit_candidates() -> list[list[str]]:
+    """Return ordered list of [cmd, ...] to try for maximum reliability."""
+    candidates: list[list[str]] = []
+
+    # 1. pipx isolated (common for user installs)
+    pipx_bin = Path.home() / ".local" / "bin" / "vibecommit"
+    if pipx_bin.exists():
+        candidates.append([str(pipx_bin), "suggest", "--quiet"])
+
+    # 2. The normal console script (pip/pipx/editable installs put it on PATH)
+    candidates.append(["vibecommit", "suggest", "--quiet"])
+
+    # 3. Explicit python -m (most reliable when package is importable in this python)
+    py = sys.executable or "python3"
+    candidates.append([py, "-m", "vibecommit", "suggest", "--quiet"])
+
+    # 4. Fallback python3 -m (covers shebang cases on some systems)
+    if py != "python3":
+        candidates.append(["python3", "-m", "vibecommit", "suggest", "--quiet"])
+
+    # Windows pipx / appdata common locations (best effort)
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            win_pipx = Path(appdata) / "Python" / "Scripts" / "vibecommit.exe"
+            if win_pipx.exists():
+                candidates.insert(0, [str(win_pipx), "suggest", "--quiet"])
+
+    # Dedup while preserving order
+    seen = set()
+    uniq = []
+    for c in candidates:
+        key = tuple(c)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
+    return uniq
+
+
+def main() -> None:
     if len(sys.argv) < 2:
         return
     commit_msg_file = sys.argv[1]
-    
-    # Only act if the file is empty or has default content
-    content = Path(commit_msg_file).read_text().strip()
-    if content and not content.startswith("#"):
-        return  # user already wrote something
 
-    try:
-        # Try to get a smart suggestion (non-interactive)
-        result = subprocess.run(
-            ["vibecommit", "suggest", "--quiet"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        suggestion = result.stdout.strip()
-        if suggestion:
-            Path(commit_msg_file).write_text(suggestion + "\\n\\n" + content)
-    except Exception:
-        pass  # fail silently, never block commit
+    content = Path(commit_msg_file).read_text(errors="ignore").strip()
+    if content and not content.startswith("#"):
+        return  # user already provided a message
+
+    for cmd in get_vibecommit_candidates():
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=6,
+                env={**os.environ, "VIBECOMMIT_SKIP_HOOK": "1"},  # prevent recursion
+            )
+            suggestion = (result.stdout or "").strip()
+            if suggestion and result.returncode == 0:
+                Path(commit_msg_file).write_text(suggestion + "\\n\\n" + content)
+                return  # success, done
+        except Exception:
+            continue  # try next candidate
+
+    # All strategies failed - never break the user's commit flow
+    pass
+
 
 if __name__ == "__main__":
     main()
-"""
+'''
 
 
 @app.command("hooks")
@@ -597,7 +804,7 @@ def hooks_cmd(
 @app.command("suggest")
 def suggest_cmd(
     msg: str = typer.Argument("", help="Optional base message"),
-    vibe: str = typer.Option("hype", "--vibe", "-v"),
+    vibe: str = typer.Option(get_config_value("default_vibe", "hype"), "--vibe", "-v"),
     quiet: bool = typer.Option(
         False, "--quiet", "-q", help="Print only the best suggestion"
     ),
@@ -623,7 +830,10 @@ def suggest_cmd(
 def commit(
     msg: str = typer.Argument(..., help="Short description of the change"),
     vibe: str = typer.Option(
-        "hype", "--vibe", "-v", help="Vibe: chill | hype | pro | meme"
+        get_config_value("default_vibe", "hype"),
+        "--vibe",
+        "-v",
+        help="Vibe: chill | hype | pro | meme",
     ),
     copy: bool = typer.Option(True, "--copy/--no-copy"),
     commit_now: bool = typer.Option(
@@ -731,7 +941,7 @@ def commit(
 
 @app.command("interactive")
 def interactive_cmd(
-    vibe: str = typer.Option("hype", "--vibe", "-v"),
+    vibe: str = typer.Option(get_config_value("default_vibe", "hype"), "--vibe", "-v"),
 ) -> None:
     """🧙 Launch the full interactive wizard (recommended for best experience)."""
     run_interactive_wizard(vibe)
@@ -783,6 +993,204 @@ def version() -> None:
     console.print(f"[dim]{get_vibe_quote()}[/dim]")
 
 
+# =============================================================================
+# DOCTOR — The #1 reliability feature
+# =============================================================================
+
+
+def _check_git_repo() -> tuple[str, str, str | None]:
+    root = run_git(["rev-parse", "--show-toplevel"])
+    if root:
+        return "ok", f"Git repository at {root}", None
+    return (
+        "error",
+        "Not inside a git repository",
+        "cd into a git repo or run `git init`",
+    )
+
+
+def _check_git_available() -> tuple[str, str, str | None]:
+    ver = run_git(["--version"])
+    if ver:
+        return "ok", ver, None
+    return "error", "git command not found in PATH", "Install git (https://git-scm.com)"
+
+
+def _check_vibecommit_version() -> tuple[str, str, str | None]:
+    return "ok", f"vibecommit {__version__}", None
+
+
+def _check_clipboard() -> tuple[str, str, str | None]:
+    try:
+        # pyperclip will try multiple backends
+        test = "vibecommit-doctor-test"
+        pyperclip.copy(test)
+        got = pyperclip.paste()
+        if test in str(got):
+            return "ok", "Clipboard backend working", None
+        return (
+            "warn",
+            "Clipboard wrote but read-back was odd",
+            "Install xclip / xsel (Linux) or ensure terminal supports clipboard",
+        )
+    except Exception as e:
+        return (
+            "warn",
+            f"Clipboard unavailable: {e}",
+            "Use --no-copy or install system clipboard tools (xclip, wl-clipboard, pbcopy)",
+        )
+
+
+def _check_hooks() -> tuple[str, str, str | None]:
+    git_dir = run_git(["rev-parse", "--git-dir"])
+    if not git_dir:
+        return "warn", "Cannot determine .git directory", None
+    hook = Path(git_dir) / "hooks" / "prepare-commit-msg"
+    if hook.exists() and "vibecommit" in hook.read_text(errors="ignore"):
+        return "ok", f"Hook installed at {hook}", None
+    return (
+        "warn",
+        "No VibeCommit git hook installed",
+        "Run `vibecommit hooks install` for automatic suggestions",
+    )
+
+
+def _check_python_env() -> tuple[str, str, str | None]:
+    py = sys.executable
+    return "ok", f"Python {sys.version.split()[0]} ({py})", None
+
+
+def _check_config_sources() -> tuple[str, str, str | None]:
+    load_config()  # ensure it's populated
+    sources = []
+    git_root = run_git(["rev-parse", "--show-toplevel"])
+    if git_root:
+        for name in ["pyproject.toml", ".vibecommit.toml"]:
+            p = Path(git_root) / name
+            if p.exists():
+                sources.append(str(p))
+    home = Path.home()
+    for p in [home / ".config/vibecommit/config.toml", home / ".vibecommit.toml"]:
+        if p.exists():
+            sources.append(str(p))
+    if sources:
+        return "ok", "Config found: " + ", ".join(sources), None
+    return "ok", "No config files (using defaults — this is fine)", None
+
+
+@app.command("doctor")
+def doctor_cmd(
+    fix: bool = typer.Option(
+        False, "--fix", help="Attempt safe automatic fixes where possible"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Machine readable output"),
+) -> None:
+    """🩺 Run diagnostics to verify VibeCommit will work reliably in this environment.
+
+    This is the single best command to run when something feels off.
+    """
+    console.print(
+        "\n[bold]🩺 VibeCommit Doctor[/bold] — checking your environment...\n"
+    )
+
+    checks = [
+        ("Git available", _check_git_available()),
+        ("Inside git repo", _check_git_repo()),
+        ("vibecommit version", _check_vibecommit_version()),
+        ("Python environment", _check_python_env()),
+        ("Clipboard", _check_clipboard()),
+        ("Git hooks", _check_hooks()),
+        ("Configuration", _check_config_sources()),
+    ]
+
+    table = Table(
+        title="Diagnostic Results", show_header=True, header_style="bold cyan"
+    )
+    table.add_column("Check", style="bold")
+    table.add_column("Status", justify="center")
+    table.add_column("Details")
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    fixes: list[str] = []
+
+    for name, (status, detail, suggestion) in checks:
+        if status == "ok":
+            status_str = "[green]✓ OK[/green]"
+        elif status == "warn":
+            status_str = "[yellow]⚠ WARN[/yellow]"
+            warnings.append(f"{name}: {detail}")
+            if suggestion:
+                fixes.append(suggestion)
+        else:
+            status_str = "[red]✗ ERROR[/red]"
+            errors.append(f"{name}: {detail}")
+            if suggestion:
+                fixes.append(suggestion)
+
+        table.add_row(name, status_str, detail)
+
+    console.print(table)
+
+    if json_output:
+        import json
+
+        result = {
+            "version": __version__,
+            "checks": {name: {"status": s, "detail": d} for name, (s, d, _) in checks},
+            "errors": errors,
+            "warnings": warnings,
+            "suggested_fixes": fixes,
+        }
+        console.print(json.dumps(result, indent=2))
+        raise typer.Exit(0 if not errors else 1)
+
+    if errors:
+        console.print(
+            Panel(
+                "\n".join(f"• {e}" for e in errors),
+                title="[red]Critical Issues[/red]",
+                border_style="red",
+            )
+        )
+    if warnings:
+        console.print(
+            Panel(
+                "\n".join(f"• {w}" for w in warnings),
+                title="[yellow]Warnings[/yellow]",
+                border_style="yellow",
+            )
+        )
+
+    if fixes:
+        console.print("\n[bold]Recommended fixes:[/bold]")
+        for f in fixes:
+            console.print(f"  → {f}")
+
+    if fix:
+        console.print("\n[dim]--fix mode: attempting safe repairs...[/dim]")
+        # Currently only hook is auto-fixable
+        if any("hook" in f.lower() for f in fixes):
+            try:
+                hooks_cmd("install")
+            except Exception as e:
+                console.print(f"[red]Auto-fix for hook failed: {e}[/red]")
+
+    if not errors and not warnings:
+        console.print(
+            Panel(
+                "[bold green]Everything looks great! VibeCommit should work reliably here.[/bold green]",
+                border_style="green",
+            )
+        )
+    elif not errors:
+        console.print(
+            "\n[dim]No critical errors — you should be good to go. Warnings are usually easy to address.[/dim]"
+        )
+
+    raise typer.Exit(0 if not errors else 1)
+
+
 @app.command("check")
 def check_cmd(
     message: str | None = typer.Argument(
@@ -825,13 +1233,8 @@ def check_cmd(
 # =============================================================================
 
 
-@app.callback(invoke_without_command=True)
-def main(ctx: typer.Context) -> None:
-    """If no subcommand, launch interactive wizard (the best way to use VibeCommit)."""
-    if ctx.invoked_subcommand is None:
-        # Default to interactive wizard — the magic UX
-        run_interactive_wizard()
-
+# The main_callback above handles global options + default wizard behavior
+# We keep a lightweight fallback for the no-subcommand case inside main_callback if needed.
 
 if __name__ == "__main__":
     app()

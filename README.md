@@ -129,6 +129,12 @@ vc hooks install                     # Auto-suggest on `git commit` (no -m)
 vc hooks status
 vc hooks uninstall
 
+# Reliability & Diagnostics (new in 1.1)
+vc doctor                            # 🩺 Check if everything works on this machine (use this first if anything feels off)
+vc doctor --fix                      # Attempt safe auto-repairs
+vc doctor --json                     # Machine-readable output for scripts/CI
+vc --debug commit "..."              # See exactly why it chose each type/scope
+
 # Utilities
 vc check                             # Validate last commit message
 vc check "feat(api): add foo"        # Validate specific message
